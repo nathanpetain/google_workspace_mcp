@@ -23,6 +23,7 @@ from email.utils import formataddr
 
 import httpx
 from fastmcp.exceptions import ToolError as ToolExecutionError
+from googleapiclient.errors import HttpError
 from mcp.types import ToolAnnotations
 
 from pydantic import Field
@@ -95,6 +96,7 @@ from gmail.gmail_helpers import (
     html_newlines_to_br,
     html_to_text_preserving_breaks,
     modify_gmail_thread_labels,
+    send_draft_once,
     send_message_once,
     update_gmail_filter,
 )
@@ -3620,6 +3622,212 @@ async def draft_gmail_message(
         attached_count, requested_attachment_count
     )
     return f"Draft created{attachment_info}! Draft ID: {draft_id}"
+
+
+async def _fetch_draft_summary(service, draft_id: str) -> Dict[str, str]:
+    """Return id, message_id, thread_id and To/Cc/Subject headers of one draft."""
+    draft = await asyncio.to_thread(
+        service.users()
+        .drafts()
+        .get(userId="me", id=draft_id, format="metadata")
+        .execute
+    )
+    message = draft.get("message", {})
+    headers = _extract_headers(message.get("payload", {}), ["To", "Cc", "Subject"])
+    return {
+        "id": draft.get("id", draft_id),
+        "message_id": message.get("id", ""),
+        "thread_id": message.get("threadId", ""),
+        "to": headers.get("To", ""),
+        "cc": headers.get("Cc", ""),
+        "subject": headers.get("Subject", ""),
+    }
+
+
+def _draft_not_found(error: HttpError, draft_id: str) -> Optional[UserInputError]:
+    if _http_error_status(error) == 404:
+        return UserInputError(
+            f"No draft with ID {draft_id!r}. It may already have been sent or deleted; "
+            "use list_gmail_drafts to see current draft IDs."
+        )
+    return None
+
+
+@server.tool(
+    title="List Gmail Drafts",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("list_gmail_drafts", is_read_only=True, service_type="gmail")
+@require_google_service("gmail", "gmail_read")
+async def list_gmail_drafts(
+    service,
+    user_google_email: str,
+    query: Annotated[
+        Optional[str],
+        Field(
+            description="Optional Gmail search query to narrow the drafts (e.g. 'to:anna@example.com' or 'subject:offer').",
+        ),
+    ] = None,
+    page_size: Annotated[
+        int,
+        Field(description="Maximum drafts to return (1-25). Defaults to 10."),
+    ] = 10,
+    page_token: Annotated[
+        Optional[str],
+        Field(description="Token for the next page, from a previous response."),
+    ] = None,
+) -> str:
+    """
+    Lists drafts with their draft IDs, recipients and subjects. Use the draft ID
+    with send_gmail_draft or delete_gmail_draft (search_gmail_messages returns
+    message IDs, which those tools do not accept).
+
+    Returns:
+        str: One line per draft, plus a next page token when there are more.
+    """
+    logger.info(f"[list_gmail_drafts] Invoked. Email: '{user_google_email}'")
+    page_size = max(1, min(int(page_size), 25))
+    params: Dict[str, Any] = {"userId": "me", "maxResults": page_size}
+    if query:
+        params["q"] = query
+    if page_token:
+        params["pageToken"] = page_token
+    response = await asyncio.to_thread(service.users().drafts().list(**params).execute)
+    drafts = response.get("drafts", [])
+    if not drafts:
+        return "No drafts found" + (f" matching {query!r}." if query else ".")
+
+    summaries = await asyncio.gather(
+        *(_fetch_draft_summary(service, d["id"]) for d in drafts)
+    )
+    lines = [f"Found {len(summaries)} drafts:", ""]
+    for i, d in enumerate(summaries, 1):
+        lines.append(f"  {i}. Draft ID: {d['id']}")
+        lines.append(f"     Subject: {d['subject'] or '(no subject)'}")
+        lines.append(f"     To: {d['to'] or '(no recipient)'}")
+        if d["cc"]:
+            lines.append(f"     Cc: {d['cc']}")
+        lines.append(f"     Message ID: {d['message_id']}")
+        lines.append("")
+    if response.get("nextPageToken"):
+        lines.append(f"Next page token: {response['nextPageToken']}")
+    return "\n".join(lines).rstrip()
+
+
+@server.tool(
+    title="Send Gmail Draft",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("send_gmail_draft", service_type="gmail")
+@require_google_service("gmail", ["gmail_read", GMAIL_COMPOSE_SCOPE, GMAIL_SEND_SCOPE])
+async def send_gmail_draft(
+    service,
+    user_google_email: str,
+    draft_id: Annotated[
+        str,
+        Field(
+            description="The draft ID, as returned by draft_gmail_message or list_gmail_drafts (not a message ID).",
+        ),
+    ],
+) -> str:
+    """
+    Sends an existing Gmail draft exactly as it is saved, including any edits
+    made in Gmail since it was created, and removes it from Drafts. THIS SENDS
+    IMMEDIATELY. The send is never retried, so an ambiguous failure is reported
+    instead of risking a duplicate.
+
+    Returns:
+        str: Confirmation with the sent message ID, recipients and subject.
+    """
+    logger.info(
+        f"[send_gmail_draft] Invoked. Email: '{user_google_email}', Draft: {draft_id}"
+    )
+    draft_id = (draft_id or "").strip()
+    if not draft_id:
+        raise UserInputError("draft_id is required.")
+    try:
+        summary = await _fetch_draft_summary(service, draft_id)
+    except HttpError as error:
+        missing = _draft_not_found(error, draft_id)
+        if missing:
+            raise missing from error
+        raise
+    if not (summary["to"] or summary["cc"]):
+        raise UserInputError(
+            f"Draft {draft_id} has no recipient. Add one in Gmail or recreate it with draft_gmail_message."
+        )
+    try:
+        sent = await send_draft_once(service, draft_id)
+    except HttpError as error:
+        missing = _draft_not_found(error, draft_id)
+        if missing:
+            raise missing from error
+        raise
+    recipients = summary["to"] + (f", cc {summary['cc']}" if summary["cc"] else "")
+    return (
+        f"Draft sent! Message ID: {sent.get('id', '')} "
+        f"To: {recipients} Subject: {summary['subject'] or '(no subject)'}"
+    )
+
+
+@server.tool(
+    title="Delete Gmail Draft",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("delete_gmail_draft", service_type="gmail")
+@require_google_service("gmail", GMAIL_COMPOSE_SCOPE)
+async def delete_gmail_draft(
+    service,
+    user_google_email: str,
+    draft_id: Annotated[
+        str,
+        Field(
+            description="The draft ID, as returned by draft_gmail_message or list_gmail_drafts (not a message ID).",
+        ),
+    ],
+) -> str:
+    """
+    Permanently deletes a Gmail draft (it does not go to Trash). Only drafts:
+    sent and received mail cannot be deleted with this tool.
+
+    Returns:
+        str: Confirmation naming the deleted draft's subject.
+    """
+    logger.info(
+        f"[delete_gmail_draft] Invoked. Email: '{user_google_email}', Draft: {draft_id}"
+    )
+    draft_id = (draft_id or "").strip()
+    if not draft_id:
+        raise UserInputError("draft_id is required.")
+    try:
+        summary = await _fetch_draft_summary(service, draft_id)
+        await asyncio.to_thread(
+            service.users().drafts().delete(userId="me", id=draft_id).execute,
+            num_retries=GOOGLE_API_WRITE_RETRIES,
+        )
+    except HttpError as error:
+        missing = _draft_not_found(error, draft_id)
+        if missing:
+            raise missing from error
+        raise
+    return (
+        f"Draft {draft_id} deleted (subject: {summary['subject'] or '(no subject)'})."
+    )
 
 
 def _format_thread_content(

@@ -139,6 +139,32 @@ Operational Gmail settings errors such as rate limits abort draft creation inste
 
 ## Label Management
 
+### list_gmail_drafts
+List drafts with their draft IDs (which `send_gmail_draft` and `delete_gmail_draft` need; search returns message IDs).
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes | | |
+| query | string | no | | Gmail search query to narrow the drafts |
+| page_size | integer | no | 10 | 1 to 25 |
+| page_token | string | no | | From a previous response |
+
+### send_gmail_draft
+Send an existing draft as saved (including edits made in Gmail). Sends immediately, never retried.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes | | |
+| draft_id | string | yes | | Draft ID from `draft_gmail_message` or `list_gmail_drafts`, not a message ID |
+
+### delete_gmail_draft
+Permanently delete a draft (not moved to Trash).
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes | | |
+| draft_id | string | yes | | Draft ID from `draft_gmail_message` or `list_gmail_drafts` |
+
 ### list_gmail_labels
 List all labels with IDs, names, and types.
 

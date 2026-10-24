@@ -81,6 +81,9 @@ For server options, transport, auth modes, tool filtering, and deployment: [refe
 | Read multiple threads | `get_gmail_threads_content_batch` |
 | Send email (new or reply) | `send_gmail_message` |
 | Create draft | `draft_gmail_message` |
+| List drafts (draft IDs) | `list_gmail_drafts` |
+| Send an existing draft | `send_gmail_draft` |
+| Delete a draft | `delete_gmail_draft` |
 | Download attachment | `get_gmail_attachment_content` |
 | Add/remove labels (one) | `modify_gmail_message_labels` |
 | Add/remove labels (batch) | `batch_modify_gmail_message_labels` |
